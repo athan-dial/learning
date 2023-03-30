@@ -1,0 +1,918 @@
+```{r}
+library(tidyverse)
+library(BiocManager)
+library(GEOquery)
+library(limma)
+library(CONOR)
+library(janitor)
+```
+
+# 1. Recent onset T1D
+
+## a) Extraction
+```{r}
+
+## Extraction of expressionSet and gene annotations ----
+eset <- getGEO(GEO = "GSE35725")
+eset <- eset[["GSE35725_series_matrix.txt.gz"]]
+# exprs(eset) = log2(exprs(eset))
+
+exprs(eset) <- backgroundCorrect(exprs(eset), method="normexp") #background correct
+exprs(eset) <- normalizeBetweenArrays(object = exprs(eset)) #normalize expression profiles
+
+anno <- as.data.frame(eset@featureData@data) #extract annotation data
+
+expr <- as.data.frame(eset@assayData[["exprs"]]) #extract expression set
+
+expr <- rownames_to_column(expr, var = 'ID') #copy rownames to their own column
+
+anno_expr <- full_join(anno,expr, by = 'ID') #merge expr and anno
+  
+```
+
+## b) Cleaning
+```{r}
+
+## EXTRACT/CLEAN ANNO DATA ##
+anno_expr <- 
+  anno_expr %>%
+  select(-GB_ACC, -SPOT_ID, -`Species Scientific Name`, -`Annotation Date`, -`Sequence Type`, -`Sequence Source`, -`Target Description`, -`Representative Public ID`,-`Gene Title`, -ENTREZ_GENE_ID, -`RefSeq Transcript ID`, -`Gene Ontology Biological Process`, -`Gene Ontology Cellular Component`, -`Gene Ontology Molecular Function`) #Deselect unnecessary columns
+
+## EXTRACT/CLEAN PHENO DATA ##
+pheno_eset <-
+  pData(eset) %>% 
+  dplyr::select(title) %>% 
+  rownames_to_column("geo_accession") %>% 
+  mutate(
+    title = str_remove(title, "UPN727 cells,"),
+    group = str_extract(title, "autologous plasma|control|recent onset|longstanding|longitudinal")
+    ) %>% 
+    mutate(group = if_else(group == "recent onset", "recent_onset", 
+                   if_else(group == "autologous plasma", "autologous_plasma", 
+                   group)))
+
+```
+
+## c) Plot
+```{r}
+## Set-up comparisons
+my_comparisons <- 
+  list(
+    c("control", "recent_onset"),
+    c("recent_onset", "longstanding"),
+    c("control", "longstanding")
+  )
+
+## Plot
+anno_expr %>% 
+  dplyr::rename(symbol = `Gene Symbol`) %>% 
+  filter(symbol %in% c("MSTN","GDF8")) %>% 
+  dplyr::select(-ID, -symbol) %>% 
+  t() %>% 
+  as.data.frame %>% 
+  rownames_to_column("geo_accession") %>% 
+  dplyr::rename(MSTN = V1) %>% 
+  left_join(pheno_eset, by = "geo_accession") %>% 
+  filter(!group %in% c("longitudinal", "autologous_plasma")) %>% 
+  mutate(group = factor(group, levels = c("control", "recent_onset", "longstanding"))) %>% 
+  ggplot(aes(x = group, y = MSTN))+
+  geom_violin()+
+  ggbeeswarm::geom_quasirandom()+
+  ggpubr::stat_compare_means(comparisons = my_comparisons, method = "t.test", p.adjust.method = "bh")
+  
+
+
+```
+## d) Designing model matrix and fitting linear model
+```{r}
+library(limma)
+
+subset <- pheno_eset %>% select(geo_accession, group) %>% filter(!group %in% c("autologous_plasma", "longitudinal"))
+
+subset_choices <- subset$geo_accession
+vec <- subset$group
+
+big <- anno_expr %>% dplyr::select(one_of(subset_choices),-ID, -`Gene Symbol`)
+
+f <- factor(as.character(vec), levels = c("control","recent_onset", "longstanding"))
+design <- model.matrix(~0+f)
+colnames(design) <- levels(f)
+
+
+
+fit <- lmFit(big,design)
+con <- makeContrasts(
+  control-recent_onset, 
+  control-longstanding, 
+  recent_onset-longstanding, 
+  levels = design
+  )
+fit <- contrasts.fit(fit, contrasts=con)
+fit <- eBayes(fit)
+
+limma::plotMA(fit, coef = 1) 
+limma::plotMA(fit, coef = 2) 
+limma::plotMA(fit, coef = 3) 
+
+
+```
+
+
+## e) topTables
+```{r}
+library(limma)
+
+# View(topTable(fit,sort="logFC",n=Inf, coef = 1))
+
+gene_names <- anno %>% select(ID = ENTREZ_GENE_ID, gene_symbol = `Gene Symbol`)
+
+## TopTable ##
+
+tt_conVSrecent <-
+  topTable(fit,sort="p",n=Inf, coef = 1, resort.by = "p") %>% 
+  rownames_to_column(var = "ID") %>% 
+  left_join(gene_names, by = "ID") %>% 
+  select(ID, gene_symbol, everything()) %>% 
+  filter(gene_symbol != "") %>% 
+  mutate(FC = 2^logFC) %>% 
+  mutate(FC = ifelse(logFC<0,FC*(-1),FC)) %>% 
+  mutate(lab_names = if_else(gene_symbol == "MSTN", "MSTN", ""))
+
+tt_conVSlong <-
+  topTable(fit,sort="p",n=Inf, coef = 2, resort.by = "p") %>% 
+  rownames_to_column(var = "ID") %>% 
+  left_join(gene_names, by = "ID") %>% 
+  select(ID, gene_symbol, everything()) %>% 
+  filter(gene_symbol != "") %>% 
+  mutate(FC = 2^logFC) %>% 
+  mutate(FC = ifelse(logFC<0,FC*(-1),FC) )%>% 
+  mutate(lab_names = if_else(gene_symbol == "MSTN", "MSTN", ""))
+
+tt_recentVSlong <-
+  topTable(fit,sort="p",n=Inf, coef = 3, resort.by = "p") %>% 
+  rownames_to_column(var = "ID") %>% 
+  left_join(gene_names, by = "ID") %>% 
+  select(ID, gene_symbol, everything()) %>% 
+  filter(gene_symbol != "") %>% 
+  mutate(FC = 2^logFC) %>% 
+  mutate(FC = ifelse(logFC<0,FC*(-1),FC)) %>% 
+  mutate(lab_names = if_else(gene_symbol == "MSTN", "MSTN", ""))
+
+  
+
+tt_conVSrecent %>% filter(gene_symbol == "MSTN")
+tt_conVSlong %>% filter(gene_symbol == "MSTN")
+tt_recentVSlong %>% filter(gene_symbol == "MSTN")
+
+
+```
+
+## f) VolcanoPlot
+```{r fig.height=6, fig.width=6}
+library(EnhancedVolcano)
+
+EnhancedVolcano(tt_conVSrecent,
+    lab = tt_conVSrecent$gene_symbol,
+    x = 'logFC',
+    y = 'P.Value',
+    # xlim = c(-5, 5),
+    # ylim = c(0, 8),
+    title = 'Recent Onset T1D',
+    pCutoff = 10e-5,
+    FCcutoff = 1,
+    transcriptPointSize = 1.5,
+    transcriptLabSize = 4.0,
+    subtitle = "",
+    selectLab = tt_conVSrecent$lab_names)
+
+EnhancedVolcano(tt_conVSlong,
+    lab = tt_conVSlong$gene_symbol,
+    x = 'logFC',
+    y = 'P.Value',
+    # xlim = c(-5, 5),
+    # ylim = c(0, 8),
+    title = 'Longstanding T1D',
+    pCutoff = 10e-5,
+    FCcutoff = 1,
+    transcriptPointSize = 1.5,
+    transcriptLabSize = 4.0,
+    subtitle = "",
+    selectLab = tt_conVSlong$lab_names)
+
+
+```
+# 2. T2D Myotubes
+
+## a) Extraction
+```{r}
+
+## Extraction of expressionSet and gene annotations ----
+eset <- getGEO(GEO = "GSE12643")
+eset <- eset[["GSE12643_series_matrix.txt.gz"]]
+# exprs(eset) = log2(exprs(eset))
+
+exprs(eset) <- backgroundCorrect(exprs(eset), method="normexp") #background correct
+exprs(eset) <- normalizeBetweenArrays(object = exprs(eset)) #normalize expression profiles
+
+anno <- as.data.frame(eset@featureData@data) #extract annotation data
+
+expr <- as.data.frame(eset@assayData[["exprs"]]) #extract expression set
+
+expr <- rownames_to_column(expr, var = 'ID') #copy rownames to their own column
+
+anno_expr <- dplyr::full_join(anno,expr, by = 'ID') #merge expr and anno
+  
+```
+
+## b) Cleaning
+```{r}
+
+## EXTRACT/CLEAN ANNO DATA ##
+anno_expr <- 
+  anno_expr %>%
+  select(-GB_ACC, -SPOT_ID, -`Species Scientific Name`, -`Annotation Date`, -`Sequence Type`, -`Sequence Source`, -`Target Description`, -`Representative Public ID`,-`Gene Title`, -ENTREZ_GENE_ID, -`RefSeq Transcript ID`, -`Gene Ontology Biological Process`, -`Gene Ontology Cellular Component`, -`Gene Ontology Molecular Function`) #Deselect unnecessary columns
+
+## EXTRACT/CLEAN PHENO DATA ##
+pheno_eset <-
+  pData(eset) %>% 
+  dplyr::select(title) %>% 
+  rownames_to_column("geo_accession") %>% 
+  mutate(
+    group = str_extract(title, "type 2 diabetes|Cont")) %>% 
+  mutate(
+    group = if_else(group == "Cont", "CON",
+            if_else(group == "type 2 diabetes", "T2D",
+                    group))
+    )
+
+pheno_eset
+```
+
+## c) Plot
+```{r}
+## Set-up comparisons
+my_comparisons <- 
+  list(
+    c("CON", "T2D")
+  )
+
+## Plot
+anno_expr %>% 
+  dplyr::rename(symbol = `Gene Symbol`) %>% 
+  filter(symbol %in% c("MSTN","GDF8")) %>% 
+  dplyr::select(-ID, -symbol) %>% 
+  t() %>% 
+  as.data.frame %>% 
+  rownames_to_column("geo_accession") %>% 
+  dplyr::rename(MSTN = V1) %>% 
+  left_join(pheno_eset, by = "geo_accession") %>% 
+  ggplot(aes(x = group, y = MSTN))+
+  geom_violin()+
+  ggbeeswarm::geom_quasirandom()+
+  ggpubr::stat_compare_means(comparisons = my_comparisons, method = "t.test", p.adjust.method = "bh")
+  
+
+
+```
+
+## d) Designing model matrix and fitting linear model
+```{r}
+library(limma)
+
+subset <- pheno_eset %>% select(geo_accession, group) 
+
+subset_choices <- subset$geo_accession
+vec <- subset$group
+
+big <- anno_expr %>% dplyr::select(one_of(subset_choices),-ID, -`Gene Symbol`)
+
+f <- factor(as.character(vec), levels = c("CON","T2D"))
+design <- model.matrix(~0+f)
+colnames(design) <- levels(f)
+
+
+
+fit <- lmFit(big,design)
+con <- makeContrasts(
+  T2D-CON,
+  levels = design
+  )
+fit <- contrasts.fit(fit, contrasts=con)
+fit <- eBayes(fit)
+
+limma::plotMA(fit, coef = 1) 
+
+
+```
+
+
+## e) topTables
+```{r}
+library(limma)
+
+# View(topTable(fit,sort="logFC",n=Inf, coef = 1))
+
+gene_names <- anno %>% select(ID = ENTREZ_GENE_ID, gene_symbol = `Gene Symbol`)
+
+## TopTable ##
+
+tt_conVSt2d <-
+  topTable(fit,sort="p",n=Inf, coef = 1, resort.by = "p") %>% 
+  rownames_to_column(var = "ID") %>% 
+  left_join(gene_names, by = "ID") %>% 
+  select(ID, gene_symbol, everything()) %>% 
+  filter(gene_symbol != "") %>% 
+  mutate(FC = 2^logFC) %>% 
+  mutate(FC = ifelse(logFC<0,FC*(-1),FC)) %>% 
+  mutate(lab_names = if_else(gene_symbol == "MSTN", "MSTN", ""))
+
+
+
+  
+
+tt_conVSt2d %>% filter(gene_symbol == "MSTN")
+
+
+```
+
+## f) VolcanoPlot
+```{r fig.height=6, fig.width=6}
+library(EnhancedVolcano)
+
+EnhancedVolcano(tt_conVSt2d,
+    lab = tt_conVSt2d$gene_symbol,
+    x = 'logFC',
+    y = 'P.Value',
+    # xlim = c(-5, 5),
+    # ylim = c(0, 8),
+    title = 'T2D vs CON',
+    pCutoff = 10e-5,
+    FCcutoff = 1,
+    transcriptPointSize = 1.5,
+    transcriptLabSize = 4.0,
+    subtitle = "",
+    selectLab = tt_conVSt2d$lab_names)
+
+```
+# 3. Myotubes after HFD
+
+## a) Extraction
+```{r}
+
+## Extraction of expressionSet and gene annotations ----
+eset <- getGEO(GEO = "GSE68231")
+eset <- eset[["GSE68231_series_matrix.txt.gz"]]
+# exprs(eset) = log2(exprs(eset))
+
+exprs(eset) <- backgroundCorrect(exprs(eset), method="normexp") #background correct
+exprs(eset) <- normalizeBetweenArrays(object = exprs(eset)) #normalize expression profiles
+
+anno <- as.data.frame(eset@featureData@data) #extract annotation data
+
+expr <- as.data.frame(eset@assayData[["exprs"]]) #extract expression set
+
+expr <- rownames_to_column(expr, var = 'ID') #copy rownames to their own column
+
+anno_expr <- dplyr::full_join(anno,expr, by = 'ID') #merge expr and anno
+  
+```
+
+## b) Cleaning
+```{r}
+
+## EXTRACT/CLEAN ANNO DATA ##
+anno_expr <- 
+  anno_expr %>%
+  select(-GB_ACC, -SPOT_ID, -`Species Scientific Name`, -`Annotation Date`, -`Sequence Type`, -`Sequence Source`, -`Target Description`, -`Representative Public ID`,-`Gene Title`, -ENTREZ_GENE_ID, -`RefSeq Transcript ID`, -`Gene Ontology Biological Process`, -`Gene Ontology Cellular Component`, -`Gene Ontology Molecular Function`) #Deselect unnecessary columns
+
+## EXTRACT/CLEAN PHENO DATA ##
+pheno_eset <-
+  pData(eset) %>% 
+  dplyr::select(title) %>% 
+  rownames_to_column("geo_accession") %>% 
+  mutate(group = str_extract(title, "group_...")) %>% 
+  mutate(group = str_remove(group,".$")) %>% 
+  rownames_to_column("rowname") %>% 
+  mutate(vec = paste(rowname, group, sep = "_"))
+
+
+pheno_eset
+```
+
+## c) Plot
+```{r}
+## Set-up comparisons
+my_comparisons <- 
+  list(
+    c("group_HR", "group_LR")
+  )
+
+## Plot
+anno_expr %>% 
+  dplyr::rename(symbol = `Gene Symbol`) %>% 
+  filter(symbol %in% c("MSTN","GDF8")) %>% 
+  dplyr::select(-ID, -symbol) %>% 
+  t() %>% 
+  as.data.frame %>% 
+  rownames_to_column("geo_accession") %>% 
+  dplyr::rename(MSTN = V1) %>% 
+  left_join(pheno_eset, by = "geo_accession") %>% 
+  ggplot(aes(x = group, y = MSTN))+
+  geom_violin()+
+  ggbeeswarm::geom_quasirandom()+
+  ggpubr::stat_compare_means(comparisons = my_comparisons, method = "t.test", p.adjust.method = "bh")
+  
+
+
+```
+
+## d) Designing model matrix and fitting linear model
+```{r}
+library(limma)
+
+vec <- pheno_eset %>% select(vec) %>% mutate(vec = word(vec, start = 2, end = 3, sep = "_")) %>% pull
+
+big <- anno_expr %>% dplyr::select(-ID, -`Gene Symbol`)
+
+f <- factor(as.character(vec), levels = c("group_LR","group_HR"))
+design <- model.matrix(~0+f)
+colnames(design) <- c("group_LR","group_HR")
+
+fit <- lmFit(big,design)
+con <- makeContrasts(group_HR-group_LR, levels = design)
+fit <- contrasts.fit(fit, contrasts=con)
+fit <- eBayes(fit)
+
+limma::plotMA(fit, coef = 1) 
+
+
+```
+
+
+## e) topTables
+```{r}
+library(limma)
+
+# View(topTable(fit,sort="logFC",n=Inf, coef = 1))
+
+gene_names <- anno %>% select(ID = ENTREZ_GENE_ID, gene_symbol = `Gene Symbol`)
+
+## TopTable ##
+
+tt <-
+  topTable(fit,sort="p",n=Inf, coef = 1, resort.by = "p") %>% 
+  rownames_to_column(var = "ID") %>% 
+  left_join(gene_names, by = "ID") %>% 
+  select(ID, gene_symbol, everything()) %>% 
+  filter(gene_symbol != "") %>% 
+  mutate(FC = 2^logFC) %>% 
+  mutate(FC = ifelse(logFC<0,FC*(-1),FC))
+  
+
+
+
+
+```
+
+## f) VolcanoPlot
+```{r fig.height=6, fig.width=6}
+library(EnhancedVolcano)
+
+EnhancedVolcano(tt,
+    lab = tt$gene_symbol,
+    x = 'logFC',
+    y = 'P.Value',
+    # xlim = c(-5, 5),
+    # ylim = c(0, 8),
+    title = 'HFD',
+    pCutoff = 10e-5,
+    FCcutoff = 1,
+    transcriptPointSize = 1.5,
+    transcriptLabSize = 4.0,
+    subtitle = "")
+
+
+```
+
+# 4. Type 2 diabetes and insulin resistance
+
+## a) Extraction
+```{r}
+
+## Extraction of expressionSet and gene annotations ----
+eset <- getGEO(GEO = "GSE22309")
+eset <- eset[["GSE22309_series_matrix.txt.gz"]]
+# exprs(eset) = log2(exprs(eset))
+
+exprs(eset) <- backgroundCorrect(exprs(eset), method="normexp") #background correct
+exprs(eset) <- normalizeBetweenArrays(object = exprs(eset)) #normalize expression profiles
+
+anno <- as.data.frame(eset@featureData@data) #extract annotation data
+
+expr <- as.data.frame(eset@assayData[["exprs"]]) #extract expression set
+
+expr <- rownames_to_column(expr, var = 'ID') #copy rownames to their own column
+
+anno_expr <- dplyr::full_join(anno,expr, by = 'ID') #merge expr and anno
+  
+```
+
+## b) Cleaning
+```{r}
+
+## EXTRACT/CLEAN ANNO DATA ##
+anno_expr <- 
+  anno_expr %>%
+  select(-GB_ACC, -SPOT_ID, -`Species Scientific Name`, -`Annotation Date`, -`Sequence Type`, -`Sequence Source`, -`Target Description`, -`Representative Public ID`,-`Gene Title`, -ENTREZ_GENE_ID, -`RefSeq Transcript ID`, -`Gene Ontology Biological Process`, -`Gene Ontology Cellular Component`, -`Gene Ontology Molecular Function`) #Deselect unnecessary columns
+
+## EXTRACT/CLEAN PHENO DATA ##
+pheno_eset <-
+  pData(eset) %>% 
+  dplyr::select(title) %>% 
+  rownames_to_column("geo_accession") %>% 
+  mutate(group = str_extract(title, "IS.*|IR.*|DB.*")) %>% 
+  mutate(vec = str_replace(group," ", "_"))
+
+pheno_eset
+```
+
+## c) Plot
+```{r}
+## Set-up comparisons
+
+groups <- pheno_eset %>% distinct(vec) %>% pull
+
+my_comparisons <- 
+  list(
+    c("IS_basal", "IS_stimulate"),
+    c("IR_basal", "IR_stimulate"),
+    c("DB_basal", "DB_stimulate")
+  )
+
+my_comparisons_basal <- 
+  list(
+    c("IS_basal", "IR_basal"),
+    c("DB_basal", "IS_basal"),
+    c("DB_basal", "IR_basal")
+  )
+
+my_comparisons_stim <- 
+  list(
+    c("IS_stimulate", "IR_stimulate"),
+    c("DB_stimulate", "IS_stimulate"),
+    c("DB_stimulate", "IR_stimulate")
+  )
+
+
+## Plot
+anno_expr %>% 
+  dplyr::rename(symbol = `Gene Symbol`) %>% 
+  filter(symbol %in% c("MSTN","GDF8")) %>% 
+  dplyr::select(-ID, -symbol) %>% 
+  t() %>% 
+  as.data.frame %>% 
+  rownames_to_column("geo_accession") %>% 
+  dplyr::rename(MSTN = V1) %>% 
+  left_join(pheno_eset, by = "geo_accession") %>% 
+  ggplot(aes(x = vec, y = MSTN))+
+  geom_violin()+
+  ggbeeswarm::geom_quasirandom()+
+  ggpubr::stat_compare_means(comparisons = my_comparisons_basal, method = "t.test", p.adjust.method = "bh")
+  
+
+
+```
+
+## d) Designing model matrix and fitting linear model
+```{r}
+library(limma)
+
+vec <- pheno_eset$vec
+big <- anno_expr %>% dplyr::select(-ID, -`Gene Symbol`)
+
+f <- factor(as.character(vec), levels = groups)
+design <- model.matrix(~0+f)
+colnames(design) <- groups
+
+fit <- lmFit(big,design)
+
+con <- 
+  makeContrasts(
+    DB_basal-IS_basal, # coef 1
+    DB_basal-IR_basal, # coef 2
+    IR_basal-IS_basal, # coef 3
+    DB_stimulate-IS_stimulate, # coef 4
+    DB_stimulate-IR_stimulate, # coef 5
+    IR_stimulate-IS_stimulate, # coef 6
+    levels = design
+  )
+
+fit <- contrasts.fit(fit, contrasts=con)
+fit <- eBayes(fit)
+
+limma::plotMA(fit, coef = 1) 
+limma::plotMA(fit, coef = 2) 
+limma::plotMA(fit, coef = 3) 
+limma::plotMA(fit, coef = 4) 
+limma::plotMA(fit, coef = 5) 
+limma::plotMA(fit, coef = 6) 
+
+groups
+
+```
+
+
+## e) topTables
+```{r}
+library(limma)
+
+# View(topTable(fit,sort="logFC",n=Inf, coef = 1))
+
+gene_names <- anno %>% dplyr::select(ID = ENTREZ_GENE_ID, gene_symbol = `Gene Symbol`)
+
+## TopTable ##
+
+
+tt <- function(coef){
+  topTable(fit,sort="p",n=Inf, coef = coef, resort.by = "p") %>% 
+  rownames_to_column(var = "ID") %>% 
+  left_join(gene_names, by = "ID") %>% 
+  select(ID, gene_symbol, everything()) %>% 
+  filter(gene_symbol != "") %>% 
+  mutate(
+    FC = 2^logFC,
+    FC = ifelse(logFC<0,FC*(-1),FC),
+    lab_values = if_else(gene_symbol == "MSTN|GDF8", "MSTN", "")
+    )
+}
+
+# DB_basal-IS_basal, # coef 1
+tt1 <- tt(1) 
+# DB_basal-IR_basal, # coef 2
+tt2 <- tt(2)
+# IR_basal-IS_basal, # coef 3
+tt3 <- tt(3)
+# DB_stimulate-IS_stimulate, # coef 4
+tt4 <- tt(4)
+# DB_stimulate-IR_stimulate, # coef 5
+tt5 <- tt(5)
+# IR_stimulate-IS_stimulate, # coef 6
+tt6 <- tt(6)
+
+
+
+```
+
+## f) VolcanoPlot
+```{r fig.height=6, fig.width=6}
+library(EnhancedVolcano)
+
+volc <- function(tt, title){
+  EnhancedVolcano(tt,
+    lab = tt$gene_symbol,
+    x = 'logFC',
+    y = 'P.Value',
+    title = title,
+    pCutoff = 10e-6,
+    FCcutoff = 1,
+    transcriptPointSize = 1.5,
+    transcriptLabSize = 4.0,
+    subtitle = "")
+}
+
+volc(tt1, "DB basal vs IS basal")
+volc(tt2, "DB basal vs IR basal")
+volc(tt3, "IR basal vs IS basal")
+volc(tt4, "DB stimulate vs IS stimulate")
+volc(tt5, "DB stimulate vs IR stimulate")
+volc(tt6, "IR stimulate vs IS stimulate")
+
+```
+
+# 5. Development of T1D 
+
+## a) Extraction
+```{r}
+
+## Extraction of expressionSet and gene annotations ----
+eset <- getGEO(GEO = "GSE30210")
+eset <- eset[["GSE30210_series_matrix.txt.gz"]]
+
+exprs(eset) <- backgroundCorrect(exprs(eset), method="normexp") #background correct
+exprs(eset) <- normalizeBetweenArrays(object = exprs(eset)) #normalize expression profiles
+
+anno <- as.data.frame(eset@featureData@data) #extract annotation data
+
+expr <- as.data.frame(eset@assayData[["exprs"]]) #extract expression set
+
+expr <- rownames_to_column(expr, var = 'ID') #copy rownames to their own column
+
+anno_expr <- dplyr::full_join(anno,expr, by = 'ID') %>% #merge expr and anno
+  select(ID, ILMN_Gene) # select id columns
+  
+```
+
+## b) Cleaning
+```{r}
+
+## EXTRACT/CLEAN PHENO DATA ##
+pheno_eset <-
+  pData(eset) %>% 
+  dplyr::select(title) %>% 
+  rownames_to_column("geo_accession") %>% 
+  mutate(
+    group = str_extract(title, "Case|Control"),
+    pair_no = str_extract(title, "[:digit:]{1}(?=_)"),
+    timepoint = word(title, 2, sep = "_")
+    )
+
+
+pheno_eset
+```
+
+## c) Plot
+```{r fig.width=15, fig.height=5}
+## Set-up comparisons
+
+groups <- pheno_eset %>% distinct(vec) %>% pull
+
+my_comparisons <- 
+  list(
+    c("1", "2"),   
+    c("2", "3"),  
+    c("3", "4"),  
+    c("4", "5"),    
+    c("5", "6"),    
+    c("6", "7")    
+  )
+
+my_comparisons_group <- 
+  list(
+    c("Control", "Case")
+  )
+
+
+
+## Plot
+anno_expr %>% 
+  dplyr::rename(symbol = ILMN_Gene) %>% 
+  filter(symbol %in% c("MSTN","GDF8")) %>% 
+  dplyr::select(GSM747675:GSM747921) %>% 
+  t() %>% 
+  as.data.frame %>% 
+  rownames_to_column("geo_accession") %>% 
+  dplyr::rename(MSTN = V1) %>% 
+  left_join(pheno_eset, by = "geo_accession") %>% 
+  filter(timepoint %in% c("1", "2", "3", "4", "5", "6", "7")) %>% 
+  mutate(group = factor(group, levels = c("Control", "Case"))) %>% 
+  
+  ggplot(aes(x = group, y = MSTN, color = group))+
+  geom_violin()+
+  ggbeeswarm::geom_quasirandom(dodge.width = 0.8)+
+  ggpubr::stat_compare_means(comparisons = my_comparisons_group, method = "t.test", p.adjust.method = "bh")
+  
+
+
+```
+
+# 6. T1D vs T2D
+
+## a) Extraction
+```{r}
+
+## Extraction of expressionSet and gene annotations ----
+eset <- getGEO(GEO = "GSE50866")
+eset <- eset[["GSE50866_series_matrix.txt.gz"]]
+# exprs(eset) = log2(exprs(eset))
+
+exprs(eset) <- backgroundCorrect(exprs(eset), method="normexp") #background correct
+exprs(eset) <- normalizeBetweenArrays(object = exprs(eset)) #normalize expression profiles
+
+anno <- as.data.frame(eset@featureData@data) #extract annotation data
+
+expr <- 
+  as.data.frame(eset@assayData[["exprs"]]) %>% #extract expression set
+  rownames_to_column(var = 'ID') %>%  #copy rownames to their own column
+  mutate(ID = as.numeric(ID))
+
+anno_expr <-
+  dplyr::full_join(anno,expr, by = 'ID') %>%  #merge expr and anno
+  select(ID, Description, GSM1231310:GSM1231368) %>% 
+  mutate(symbol = word(Description, -1, sep = " ")) %>% 
+  mutate(symbol = str_replace(symbol, "\\(", "")) %>% 
+  mutate(symbol = str_replace(symbol, "\\)$", "")) %>% 
+  select(symbol, everything())
+
+```
+
+## b) Cleaning
+```{r}
+
+## EXTRACT/CLEAN PHENO DATA ##
+pheno_eset <-
+  pData(eset) %>% 
+  dplyr::select(title) %>% 
+  rownames_to_column("geo_accession") %>% 
+  mutate(group = str_extract(title, "NGT|T1DM|T2DM"),
+         vec = group)
+
+pheno_eset
+```
+
+## c) Plot
+```{r}
+## Set-up comparisons
+my_comparisons <- 
+  list(
+    c("NGT", "T1DM"),
+    c("NGT", "T2DM"),
+    c("T1DM", "T2DM")
+  )
+
+## Plot
+anno_expr %>% 
+  filter(symbol %in% c("MSTN","GDF8")) %>% 
+  dplyr::select(-ID, -symbol, -Description) %>% 
+  t() %>% 
+  as.data.frame %>% 
+  rownames_to_column("geo_accession") %>% 
+  dplyr::rename(MSTN = V1) %>% 
+  left_join(pheno_eset, by = "geo_accession") %>% 
+  mutate(group = factor(group, levels = c("NGT", "T1DM", "T2DM"))) %>% 
+  
+  ggplot(aes(x = group, y = MSTN))+
+  geom_violin()+
+  ggbeeswarm::geom_quasirandom()+
+  ggpubr::stat_compare_means(comparisons = my_comparisons, method = "t.test", p.adjust.method = "bh")
+  
+
+
+```
+
+## d) Designing model matrix and fitting linear model
+```{r}
+library(limma)
+
+vec <- pheno_eset %>% select(vec) %>% mutate(vec = word(vec, start = 2, end = 3, sep = "_")) %>% pull
+
+big <- anno_expr %>% dplyr::select(-ID, -`Gene Symbol`)
+
+f <- factor(as.character(vec), levels = c("group_LR","group_HR"))
+design <- model.matrix(~0+f)
+colnames(design) <- c("group_LR","group_HR")
+
+fit <- lmFit(big,design)
+con <- makeContrasts(group_HR-group_LR, levels = design)
+fit <- contrasts.fit(fit, contrasts=con)
+fit <- eBayes(fit)
+
+limma::plotMA(fit, coef = 1) 
+
+
+```
+
+
+## e) topTables
+```{r}
+library(limma)
+
+# View(topTable(fit,sort="logFC",n=Inf, coef = 1))
+
+gene_names <- anno %>% select(ID = ENTREZ_GENE_ID, gene_symbol = `Gene Symbol`)
+
+## TopTable ##
+
+tt <-
+  topTable(fit,sort="p",n=Inf, coef = 1, resort.by = "p") %>% 
+  rownames_to_column(var = "ID") %>% 
+  left_join(gene_names, by = "ID") %>% 
+  select(ID, gene_symbol, everything()) %>% 
+  filter(gene_symbol != "") %>% 
+  mutate(FC = 2^logFC) %>% 
+  mutate(FC = ifelse(logFC<0,FC*(-1),FC))
+  
+
+
+
+
+```
+
+## f) VolcanoPlot
+```{r fig.height=6, fig.width=6}
+library(EnhancedVolcano)
+
+EnhancedVolcano(tt,
+    lab = tt$gene_symbol,
+    x = 'logFC',
+    y = 'P.Value',
+    # xlim = c(-5, 5),
+    # ylim = c(0, 8),
+    title = 'HFD',
+    pCutoff = 10e-5,
+    FCcutoff = 1,
+    transcriptPointSize = 1.5,
+    transcriptLabSize = 4.0,
+    subtitle = "")
+
+
+```

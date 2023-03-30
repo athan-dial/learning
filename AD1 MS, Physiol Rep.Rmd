@@ -1,0 +1,719 @@
+---
+title: "Diabetologia MS - AD1"
+chunk_output_type: null
+editor_options: null
+output:
+  html_document:
+    code_folding: "hide"
+    df_print: paged
+---
+```{r global_options, include=FALSE}
+
+knitr::opts_chunk$set(error = FALSE, warning = FALSE, message = FALSE)
+```
+
+
+```{r Refresh}
+# rm(list=ls())
+```
+
+# Load Packages
+```{r Import packages}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(extrafont))
+suppressPackageStartupMessages(library(scales))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(caret))
+suppressPackageStartupMessages(library(lme4))
+suppressPackageStartupMessages(library(MASS))
+suppressPackageStartupMessages(library(ggbeeswarm))
+library(readxl)
+library(broom)
+library(leaps)
+library(DataExplorer)
+library(Hmisc)
+library(cowplot)
+library(ggpubr)
+options(scipen = 999)
+```
+
+```{r Import data}
+baseline <- read_csv("C:/Users/Dial_/OneDrive - McMaster University/Lab/- PERSONAL/Data/T1D/~MASTER/3. Validated/2020-02-10 BASELINE.csv")
+
+```
+
+```{r Clean data}
+
+## VARIABLE CREATION ##
+baseline <-
+  baseline %>% 
+    mutate(
+      SubGroup = paste0(Group,"-",Sex),
+      Lean_kg = Weight_kg*Lean_percent,
+      ELISA_Lean = ELISA_2019/Lean_kg,
+      HbA1c_Lean = HbA1c/Lean_kg,
+      Lean_percent = 1-BF_percent,
+      Lean_kg = Weight_kg*Lean_percent, 
+      ELISA_Lean = ELISA_2019/Lean_kg,
+      Insulin_Lean = Insulin_inj_dose/Lean_kg
+           ) %>% 
+    dplyr::select(Subject, Group, Sex, everything()) 
+
+
+```
+
+
+#QC
+```{r}
+
+
+
+
+## Normality Checks
+baseline %>% 
+  dplyr::select(corVars) %>% 
+  keep(is.numeric) %>% 
+  sapply(shapiro.test) %>% 
+  t() %>% 
+  .[,2] %>% 
+  as.data.frame() %>% 
+  t %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "variable") %>% 
+  rename(p.value = V1) %>% 
+  mutate(multiple_mean_comparison_test = ifelse(p.value < 0.05, "Kruskal-Wallis", "ANOVA"),
+         single_mean_comparison_test = ifelse(p.value < 0.05, "Mann-Whitney-U", "T-Test"),
+         correlation_test = ifelse(p.value < 0.05, "Spearman", "Pearson"),
+         normality_test = "Shapiro-Wilks Normality Test") %>%
+  dplyr::select(variable, normality_test, everything()) 
+
+  # RESULT: Both MSTN measures are non-normal. Therefore, use spearman correlation for analysis
+
+```
+
+
+
+#CORRELATION DATA
+```{r Correlation Matrix}
+
+num_vars <- baseline %>% keep(is.numeric) %>% names
+corVars <- c("Age", "Weight_kg", "Height_m", "BMI", "BF_percent", "Lean_percent", "BF_kg", "Lean_kg", "HbA1c", "Duration_T1D", "Diagnosis_Age", "MVC", "ELISA_2019", "IM_Mstn15")
+
+
+# baseline.cor.ovr <- baseline %>% dplyr::select(num_vars)
+# baseline.cor.con <- baseline %>% filter(Group == "CON") %>% dplyr::select(num_vars)
+# baseline.cor.t1d <- baseline %>% filter(Group == "T1D") %>% dplyr::select(num_vars)
+# baseline.cor.male <- baseline %>% filter(Sex == "Male") %>% dplyr::select(num_vars)
+baseline.cor.female <- baseline %>% filter(Sex == "Female") %>% dplyr::select(num_vars)
+
+# res <- rcorr(as.matrix(baseline.cor.ovr), type="spearman")
+# res <- rcorr(as.matrix(baseline.cor.con), type="spearman")
+# res <- rcorr(as.matrix(baseline.cor.t1d), type="spearman")
+# res <- rcorr(as.matrix(baseline.cor.male), type="spearman")
+res <- rcorr(as.matrix(baseline.cor.female), type="spearman")
+
+# ++++++++++++++++++++++++++++
+# flattenCorrMatrix
+# ++++++++++++++++++++++++++++
+# cormat : matrix of the correlation coefficients
+# pmat : matrix of the correlation p-values
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )
+}
+
+corsig = flattenCorrMatrix(res$r, res$P)
+
+## VIEW MATRIX ##
+corsig %>% 
+  filter(p < 0.1) %>%
+  filter(cor < 1 & cor > -1) %>%
+  filter(
+    ((row == "ELISA_2019" & column %in% corVars) |
+    (column == "ELISA_2019" & row %in% corVars))
+    # ((row == "IM_Mstn15" & column %in% corVars)|
+    # (column == "IM_Mstn15" & row %in% corVars))
+    ) %>%
+  arrange(-abs(cor))
+
+corsig %>% 
+  filter(p < 0.1) %>%
+  filter(cor < 1 & cor > -1) %>%
+  filter(
+    # ((row == "ELISA_2019" & column %in% corVars) |
+    # (column == "ELISA_2019" & row %in% corVars))
+    ((row == "IM_Mstn15" & column %in% corVars)|
+    (column == "IM_Mstn15" & row %in% corVars))
+    ) %>%
+  arrange(-abs(cor))
+
+```
+
+# MS FIGURES
+
+## SETUP
+```{r}
+
+#Factor subgroup column to order for plots
+baseline$SubGroup <- factor(baseline$SubGroup, levels = c("CON-Female", "CON-Male", "T1D-Female", "T1D-Male"))
+#Set comparisons for subgroup
+my_comparisons <- list( c("CON-Male", "CON-Female"), c("T1D-Male", "T1D-Female"), 
+                        c("CON-Male", "T1D-Male"), c("CON-Female", "T1D-Female")
+                      )
+## Format axis labels (in order to scale muscle MSTN to be similar serum MSTN)
+axis_formatter <- function(x){ 
+    x/100 
+}
+
+
+## twobar: 2-bar plot function
+
+twobar <- function(dat, x_var, y_var, fill_var, y_lab){
+
+  x_var = enquo(x_var)
+  y_var = enquo(y_var)
+  fill_var = enquo(fill_var)
+  
+  dat %>% 
+   ggplot(aes(x = !!x_var, y = !!y_var)) +
+   stat_summary(fun.data = mean_se, geom = "errorbar", width=0.2, size = 1, color = "#000000") +
+   stat_summary(fun = mean, geom = "bar", width=0.8, size = 1, color = "#000000", fill=c("#ffffff", "#000000")) +
+   theme_classic() +
+   scale_y_continuous(expand = c(0, 0)) +
+   scale_shape_manual(values=c(21,24)) +
+   scale_color_manual(values=c("#000000","#000000")) +
+   scale_fill_manual(values=c("#cc85b1", "#8aa9d5")) +
+   ggbeeswarm::geom_quasirandom(aes(shape = !!x_var, fill = !!fill_var), size = 3, stroke = 1, width = 0.2)+
+    theme(
+          text=element_text(size = 18, face = "bold"),
+          axis.title = element_text(face = "bold"),
+          axis.text = element_text(face = "bold"),
+          plot.title = element_text(vjust= 7.5),
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(color = "black"),
+          axis.title.y = element_text(vjust = 4.5),
+          axis.text.y = element_text(color = "black"),
+          legend.position = "none",
+          axis.ticks.x = element_blank(),
+          plot.margin = unit(c(20,0,0,0),"pt"),
+          aspect.ratio = 1
+          ) + 
+   labs(y = y_lab) + 
+    stat_compare_means(method = "wilcox.test", label.x = 0.6) +
+    coord_cartesian(clip = "off")
+
+}
+
+## fourbar: 4-bar plot for subgroup comparison
+fourbar <- function(dat, x_var, y_var, fill_var, y_lab, pval_y){
+  
+  x_var = enquo(x_var)
+  y_var = enquo(y_var)
+  fill_var = enquo(fill_var)
+
+  dat %>% 
+   ggplot(aes(x = !!x_var, y = !!y_var)) +
+   stat_summary(fun.data = mean_se, geom = "errorbar", width=0.2, size = 1, color = "#000000") +
+   stat_summary(fun = mean, geom = "bar", width=0.8, size = 1, color = "#000000", fill=c("#ffffff", "#ffffff", "#000000", "#000000")) +
+   theme_classic() +
+   scale_y_continuous(expand = c(0, 0)) +
+   scale_shape_manual(values=c(21,24)) +
+   scale_color_manual(values=c("#000000","#000000", "#000000", "#000000")) +
+   scale_fill_manual(values=c("#cc85b1", "#8aa9d5", "#cc85b1", "#8aa9d5")) +
+   ggbeeswarm::geom_quasirandom(aes(shape = Group, fill = !!fill_var), size = 3, stroke = 1, width = 0.2)+
+    theme(
+          text=element_text(size = 18, face = "bold"),
+          axis.title = element_text(face = "bold"),
+          axis.text = element_text(face = "bold"),
+          plot.title = element_text(vjust= 7.5),
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(color = "black"),
+          axis.title.y = element_text(vjust = 4.5),
+          axis.text.y = element_text(color = "black"),
+          legend.position = "none",
+          axis.ticks.x = element_blank(),
+          plot.margin = unit(c(20,0,0,0),"pt"),
+          aspect.ratio = 1
+          ) + 
+   labs(y = y_lab) + 
+    coord_cartesian(clip = "off") + 
+    stat_compare_means(comparisons = my_comparisons, method = "wilcox.test",
+                       aes(family = "Segoe UI", label = ..p.adj..)
+                       ) +
+    stat_compare_means(label.y = pval_y,
+                       method = "kruskal.test")
+}
+
+scatplot <- function(dat, x_var, y_var, x_lab, y_lab, pval_x, pval_y){
+  
+  x_var = enquo(x_var)
+  y_var = enquo(y_var)
+
+  dat %>%
+    ggplot(aes(x = !!x_var, y = !!y_var)) + 
+    scale_shape_manual(values=c(21, 24)) +
+    geom_smooth(color = "black", method = "lm", se=T, size = 2, linetype = "solid") +
+    geom_smooth(aes(linetype = Group, color = Group), method = "lm", se=F, size = 1)+
+    geom_point(aes(color = Group, shape = Group, fill = Sex), size = 3) +
+    scale_linetype_manual(values=c("longdash", "solid"))+
+    scale_color_manual(values=c("#000000","#000000")) +
+    scale_fill_manual(values=c("#cc85b1", "#8aa9d5")) +
+    theme_classic() +
+    theme(
+          text=element_text(size = 18, face = "bold"),
+          axis.title = element_text(face = "bold"),
+          axis.title.y = element_text(margin = margin(t = 0, r = 20, b = 0, l = 0)),
+          axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 20)),
+          axis.text.y = element_text(colour="black"),
+          axis.text.x = element_text(colour="black"),
+          legend.position = "none",
+          aspect.ratio = 1
+          ) +
+    labs(y = y_lab,
+         x = x_lab)  +
+      stat_cor(aes(
+                 label = paste(c("ALL"),..r.label.., cut(..p.., breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),
+                                                         labels = c("'****'", "'***'", "'*'", "'*'", "''")), sep = "~")),
+               label.x.npc = pval_x, label.y.npc = pval_y, method = "spearman")+
+      stat_cor(aes(color=Group,
+                   label = paste(c("CON","T1D"),..r.label.., cut(..p.., breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),
+                                                                 labels = c("'****'", "'***'", "'*'", "'*'", "''")), sep = "~")),
+               label.x.npc = pval_x, label.y.npc = pval_y+0.1, method = "spearman")
+
+}
+```
+
+
+## FIGURE 1
+```{r Serum Myostatin group comparison, fig.cap="Mean Comparison: Serum Myostatin"}
+
+
+
+#Plot
+
+Fig1A <- 
+  twobar(dat = baseline, 
+         x_var = Group,
+         y_var = ELISA_2019, 
+         fill_var = Sex, 
+         y_lab = "Serum myostatin\nprotein expression (pg/mL)"
+         )
+
+Fig1B <-
+  fourbar(dat = baseline,
+          x_var = SubGroup, 
+          y_var = ELISA_2019,
+          fill_var = Sex,
+          y_lab = "Serum myostatin\nprotein expression (pg/mL)",
+          pval_y = 11000
+          )
+
+
+Fig1C <- 
+  twobar(dat = baseline, 
+         x_var = Group,
+         y_var = ELISA_Lean, 
+         fill_var = Sex, 
+         y_lab = "Serum myostatin\nprotein expression (pg/mL/kg)"
+         )
+
+
+
+Fig1D <-
+   fourbar(dat = baseline,
+          x_var = SubGroup, 
+          y_var = ELISA_Lean,
+          fill_var = Sex,
+          y_lab = "Serum myostatin\nprotein expression (pg/mL/kg)",
+          pval_y = 250
+          )
+
+
+
+Fig1E <-
+  scatplot(
+    dat = baseline,
+    x_var = Lean_kg,
+    y_var = ELISA_2019,
+    pval_x = 0.6,
+    pval_y = 0.825,
+    x_lab = "Lean mass (kg)",
+    y_lab = "Serum myostatin\nprotein expression (pg/mL)"
+    )
+
+Fig1F <-
+  scatplot(
+    dat = baseline,
+    x_var = MVC,
+    y_var = ELISA_2019,
+    pval_x = 0.6,
+    pval_y = 0.05,
+    x_lab = "MVC (Nm)",
+    y_lab = "Serum myostatin\nprotein expression (pg/mL)"
+    )
+
+Fig1G <-
+  scatplot(
+    dat = baseline,
+    x_var = BF_kg,
+    y_var = ELISA_2019,
+    pval_x = 0.6,
+    pval_y = 0.875,
+    x_lab = "Body fat (kg)",
+    y_lab = "Serum myostatin\nprotein expression (pg/mL)"
+    )
+
+Fig1H <-
+ baseline %>% 
+  ggplot(aes(y=ELISA_2019, x=HbA1c)) + 
+  scale_shape_manual(values=c(21, 24)) +
+  geom_smooth(data=subset(baseline, Group == "T1D"),
+    aes(linetype = Group, color = Group), method = "lm", se=T, size = 1)+
+  geom_point(aes(color = Group, shape = Group, fill = Sex), size = 3) +
+  scale_linetype_manual(values= "solid") +
+  scale_color_manual(values=c("#000000","#000000")) +
+  scale_fill_manual(values=c("#cc85b1", "#8aa9d5")) +
+  scale_y_continuous(breaks = pretty_breaks())+
+  scale_x_continuous(breaks = pretty_breaks())+
+  theme_classic() +
+  theme(
+        text = element_text(size = 18, face = "bold"),
+        axis.title.y = element_text(margin = margin(t = 0, r = 20, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 20)),
+        axis.text.y = element_text(colour="black"),
+        axis.text.x = element_text(colour="black"),
+        legend.position = "none",
+        aspect.ratio = 1
+        ) +
+  labs(y = "Serum myostatin\nprotein expression (pg/mL)",
+       x = "HbA1c (%)") +
+  stat_cor(
+    data=subset(baseline, Group == "T1D"),
+      aes(
+      color=Group,
+      label = paste(c("T1D"),..r.label.., cut(..p.., 
+      breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),
+      labels = c("'****'", "'***'", "'**'", "'*'", "''")), 
+      sep = "~")),
+      label.x.npc = 0.6, 
+      method = "spearman"
+       )
+
+```
+
+## FIGURE 2  
+```{r}
+
+Fig2A <-
+  ggplot(baseline, aes(x = Group, y = IM_Mstn15)) +
+   stat_summary(fun.data = mean_se, geom = "errorbar", width=0.2, size = 1, color = "#000000") +
+   stat_summary(fun.y = mean, geom = "bar", width=0.8, size = 1, color = "#000000", fill=c("#ffffff", "#000000")) +
+   theme_classic() +
+   scale_y_continuous(expand = c(0, 0), labels = axis_formatter) +
+   scale_shape_manual(values=c(21,24)) +
+   scale_color_manual(values=c("#000000","#000000")) +
+   scale_fill_manual(values=c("#cc85b1", "#8aa9d5")) +
+   ggbeeswarm::geom_quasirandom(data = baseline, aes(y=IM_Mstn15, x=Group, shape=Group, fill=Sex), size = 3, stroke = 1, width = 0.2)+
+    theme(
+          text=element_text(size = 18, face = "bold"),
+          plot.title = element_text(vjust= 7.5),
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(color = "black"),
+          axis.title.y = element_text(vjust = 4.5),
+          axis.text.y = element_text(color = "black"),
+          legend.position = "none",
+          axis.ticks.x = element_blank(),
+          plot.margin = unit(c(20,20,20,20),"pt"),
+          aspect.ratio = 1) + 
+    labs(y="Muscle myostatin\nprotein expression (AU)",
+         x="Group") + 
+    stat_compare_means(method = "wilcox.test", label.x.npc = 1, label.y.npc = 1) +
+    coord_cartesian(clip = "off")
+
+Fig2B <-
+  fourbar(dat = baseline,
+          x_var = SubGroup, 
+          y_var = IM_Mstn15,
+          fill_var = Sex,
+          y_lab = "Muscle myostatin\nprotein expression (AU)",
+          pval_y = 350000
+          ) +
+  scale_y_continuous(expand = c(0, 0), labels = axis_formatter)
+
+Fig2C <-
+  scatplot(
+    dat = baseline,
+    x_var = Lean_kg,
+    y_var = IM_Mstn15,
+    pval_x = 0.6,
+    pval_y = 0.825,
+    x_lab = "Lean mass (kg)",
+    y_lab = "Muscle myostatin\nprotein expression (AU)"
+    )+
+    scale_y_continuous(labels = axis_formatter)
+
+
+Fig2D <-
+  scatplot(
+    dat = baseline,
+    x_var = MVC,
+    y_var = IM_Mstn15,
+    pval_x = 0.6,
+    pval_y = 0.85,
+    x_lab = "MVC (Nm)",
+    y_lab = "Muscle myostatin\nprotein expression (AU)"
+    )+
+    scale_y_continuous(labels = axis_formatter)
+
+Fig2E <-
+  scatplot(
+    dat = baseline,
+    x_var = BF_kg,
+    y_var = IM_Mstn15,
+    pval_x = 0.6,
+    pval_y = 0.875,
+    x_lab = "Body fat (kg)",
+    y_lab = "Muscle myostatin\nprotein expression (AU)"
+    )+
+    scale_y_continuous(labels = axis_formatter)
+
+Fig2F <-
+ baseline %>% 
+  ggplot(aes(y=IM_Mstn15, x=HbA1c)) + 
+  scale_shape_manual(values=c(21, 24)) +
+  geom_smooth(data=subset(baseline, Group == "T1D"),
+    aes(linetype = Group, color = Group), method = "lm", se=T, size = 1)+
+  geom_point(aes(color = Group, shape = Group, fill = Sex), size = 3) +
+  scale_linetype_manual(values= "solid") +
+  scale_color_manual(values=c("#000000","#000000")) +
+  scale_fill_manual(values=c("#cc85b1", "#8aa9d5")) +
+  scale_y_continuous(breaks = pretty_breaks(), labels = axis_formatter)+
+  scale_x_continuous(breaks = pretty_breaks())+
+  theme_classic() +
+  theme(
+          text=element_text(size = 18, face = "bold"),
+        axis.title.y = element_text(margin = margin(t = 0, r = 20, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 20)),
+        axis.text.y = element_text(colour="black"),
+        axis.text.x = element_text(colour="black"),
+        legend.position = "none",
+        aspect.ratio = 1
+        ) +
+  labs(y = "Muscle myostatin\nprotein expression (AU)",
+       x = "HbA1c (%)") +
+  stat_cor(
+    data=subset(baseline, Group == "T1D"),
+      aes(
+      color=Group,
+      label = paste(c("T1D"),..r.label.., cut(..p.., 
+      breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),
+      labels = c("'****'", "'***'", "'**'", "'*'", "''")), 
+      sep = "~")),
+      label.x.npc = 0.6, 
+      method = "spearman"
+       )
+
+```
+
+
+
+## FIGURE 3
+```{r Correlation Plots}
+
+## Variables used in paper
+corVars <- c("Age", "Weight_kg", "Height_m", "BMI", "BF_percent", "Lean_percent", "BF_kg", "Lean_kg", "HbA1c", "Duration_T1D", "Diagnosis_Age", "MVC", "ELISA_2019", "IM_Mstn15", "ELISA_Lean")
+
+baseline.cor.ovr <- baseline %>% dplyr::select(corVars)
+baseline.cor.con <- baseline %>% filter(Group == "CON") %>% dplyr::select(corVars)
+baseline.cor.t1d <- baseline %>% filter(Group == "T1D") %>% dplyr::select(corVars)
+baseline.cor.male <- baseline %>% filter(Sex == "Male") %>% dplyr::select(corVars)
+baseline.cor.female <- baseline %>% filter(Sex == "Female") %>% dplyr::select(corVars)
+
+corr_plot <- function(dat) {
+  ggcorr(
+    dat, 
+    low = "#5365FC", 
+    mid = "white", 
+    high = "#FF2D00",
+    label = FALSE,  
+    hjust = 0.85, 
+    geom = "tile",
+    layout.exp = 1
+  )
+}
+
+
+corr_plot(baseline.cor.ovr)
+corr_plot(baseline.cor.con)
+corr_plot(baseline.cor.t1d)
+corr_plot(baseline.cor.male)
+corr_plot(baseline.cor.female)
+
+
+p <- ggcorr(baseline.cor.con,
+       palette = "RdBu",
+       geom = "blank",
+       label = TRUE,
+       hjust = 0.75,
+       color = "grey40",
+       layout.exp = 1) +
+  # geom_point(size = 10,
+  #            aes(color = coefficient > 0, alpha = abs(coefficient) > 0.4)) +
+  scale_alpha_manual(values = c("TRUE" = 0.25, "FALSE" = 0)) +
+  guides(color = FALSE, alpha = FALSE) + 
+  theme(panel.background = element_rect(fill = "transparent")) 
+
+ggsave(p, filename = "tr_tst.svg",  bg = "transparent")
+```
+
+## ESM
+```{r}
+FigS1A <- 
+  twobar(
+    dat = baseline,
+    x_var = Group,
+    y_var = MVC,
+    y_lab = "MVC (Nm)",
+    fill_var = Sex
+  )
+
+FigS1B <- 
+  baseline %>% 
+    ggplot(aes(x=Duration_T1D, y=ELISA_2019)) + 
+    scale_shape_manual(values=c(21, 24)) +
+    geom_smooth(data=subset(baseline, Group == "T1D"),
+      aes(linetype = Group, color = Group), method = "lm", se=T, size = 1)+
+    geom_point(aes(color = Group, shape = Group, fill = Sex), size = 3) +
+    scale_linetype_manual(values= "solid") +
+    scale_color_manual(values=c("#000000","#000000")) +
+    scale_fill_manual(values=c("#cc85b1", "#8aa9d5")) +
+    scale_x_continuous(breaks = pretty_breaks())+
+    scale_y_continuous(breaks = pretty_breaks())+
+    theme_classic() +
+    theme(
+          text = element_text(size = 18, face = "bold"),
+          axis.title.y = element_text(margin = margin(t = 0, r = 20, b = 0, l = 0)),
+          axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 20)),
+          axis.text.y = element_text(colour="black"),
+          axis.text.x = element_text(colour="black"),
+          legend.position = "none",
+          aspect.ratio = 1
+          ) +
+    labs(y = "Serum myostatin\nprotein expression\n(pg/mL/kg)",
+         x = "Duration of T1D (yr)") +
+    stat_cor(
+      data=subset(baseline, Group == "T1D"),
+        aes(
+        color=Group,
+        label = paste(c("T1D"),..r.label.., cut(..p.., 
+        breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),
+        labels = c("'****'", "'***'", "'**'", "'*'", "''")), 
+        sep = "~")),
+        label.x.npc = 0.6, 
+        method = "spearman"
+         )
+
+
+```
+
+
+
+#FULL PANELS
+## Fig 1
+```{r, fig.height=22, fig.width=16}
+labels <-  c('a', 'b', 'c', "d", "e", "f", "g", "h")
+
+plot_grid(Fig1A, Fig1B, Fig1C, Fig1D, Fig1E, Fig1F, Fig1G, Fig1H,
+          labels = labels, 
+          label_size = 24, 
+          ncol = 2, 
+          align = "h", 
+          axis = "bt")
+```
+## Fig 2
+```{r Figure 1E-F, fig.height=11, fig.width=16.5}
+
+labels <-  c('a', 'b', 'c', "d", "e", "f")
+
+plot_grid(
+  Fig2A, Fig2B, Fig2C, Fig2D, Fig2E, Fig2F,
+  labels = labels, 
+  label_size = 24, 
+  ncol = 3, 
+  align = "h", 
+  axis = "bt"
+  )
+
+```
+## ESM
+```{r, fig.height=5.5, fig.width=5.5}
+FigS1A + 
+  theme(plot.margin = unit(c(20,0,0,0),"pt"))
+
+plot_grid(FigS1A,
+          labels = "a", 
+          label_size = 24, 
+          ncol = 1, 
+          align = "h", 
+          axis = "bt")
+
+FigS1B
+
+
+```
+
+```{r}
+scatplot(
+  dat = baseline,
+  x_var = Lean_kg,
+  y_var = IM_Mstn15,
+  x_lab = "",
+  y_lab = "",
+  pval_x = .65,
+  pval_y = .8
+)
+
+baseline %>% 
+  ggplot(aes(color = Group, x = Lean_kg, y = IM_Mstn15))+
+  geom_smooth(method = lm)+
+  stat_cor(method = "spearman")
+```
+
+
+
+# SUBJECT CHARACTERISTICS
+```{r Subject Characteristics}
+library(tidyverse)
+library(kableExtra)
+library(plotrix)
+
+baseline %>%
+  filter(!is.na(IM_Mstn15) | !is.na(ELISA_2019)) %>%
+  group_by(Group, Sex) %>% 
+  summarise(n = n(),
+            Age = paste0(round(mean(Age),2),"(",round(std.error(Age),2),")"),
+            Height = paste0(round(mean(Height_m),2),"(",round(std.error(Height_m),2),")"),
+            Weight = paste0(round(mean(Weight_kg),2),"(",round(std.error(Weight_kg),2),")"),
+            BMI = paste0(round(mean(BMI),2),"(",round(std.error(BMI),2),")"),
+            HbA1c = paste0(round(mean(HbA1c, na.rm = T),2),"(",round(std.error(HbA1c, na.rm = T),2),")"),
+            `T1D Duration` = paste0(round(mean(Duration_T1D, na.rm = T),2),"(",round(std.error(Duration_T1D, na.rm = T),2),")"),
+            `Diabetes Onset` = paste0(round(mean(Diagnosis_Age, na.rm = T),2),"(",round(std.error(Diagnosis_Age, na.rm = T),2),")")
+            ) %>% 
+  t() %>% 
+  as.data.frame()
+```
+
+```{r}
+baseline %>% 
+  filter(!is.na(Lean_kg) & !is.na(IM_Mstn15)) %>% 
+  group_by(Group) %>% 
+  summarise(n = n())
+
+
+```
+

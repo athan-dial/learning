@@ -1,0 +1,76 @@
+```{r}
+scatplot(
+    dat = baseline,
+    x_var = IM_Mstn15,
+    y_var = ELISA_Lean,
+    pval_x = 0.6,
+    pval_y = 0.875,
+    x_lab = "",
+    y_lab = ""
+    )+
+  ggrepel::geom_text_repel(aes(label = Subject))+
+  ggalt::geom_encircle(data = baseline %>% filter(Subject %in% c("O", "OS9", "OS10")), spread = 0.2, color = "red", alpha = 1)
+
+
+scatplot(
+    dat = baseline %>% filter(!Subject %in% c("O", "OS9", "OS10")),
+    x_var = IM_Mstn15,
+    y_var = ELISA_Lean,
+    pval_x = 0.6,
+    pval_y = 0.875,
+    x_lab = "",
+    y_lab = ""
+    )
+
+test_df <-
+  baseline %>% 
+  keep(is.numeric) %>% 
+  bind_cols(
+    baseline %>% 
+    mutate(out_grp = if_else(Subject %in% c("O", "OS9", "OS10"), "out","in")) %>% 
+    dplyr::select(out_grp)
+  ) %>% 
+  dplyr::select(out_grp, everything())
+
+test_out <- test_df %>% filter(out_grp == "out")
+test_in <- test_df %>% filter(out_grp == "in")
+  
+
+matrixTests::col_wilcoxon_twosample(x = test_in[,2:ncol(test_in)], y = test_out[,2:ncol(test_out)]) %>% 
+  rownames_to_column("variable") %>% 
+  filter(pvalue < 0.1)
+
+twobar(
+  dat = test_df,
+  x_var = out_grp,
+  y_var = Lean_percent,
+  fill_var = out_grp,
+  y_lab = ""
+  )
+
+twobar(
+  dat = test_df,
+  x_var = out_grp,
+  y_var = ELISA_2019,
+  fill_var = out_grp,
+  y_lab = ""
+  )
+
+
+```
+
+```{r}
+scatplot(
+    dat = baseline,
+    x_var = IM_Mstn15,
+    y_var = ELISA_2019,
+    pval_x = 0.6,
+    pval_y = 0.875,
+    x_lab = "",
+    y_lab = ""
+    )+
+  ggrepel::geom_text_repel(aes(label = Subject))+
+  ggalt::geom_encircle(data = baseline %>% filter(Subject %in% c("O", "OS9", "OS10")), spread = 0.2, color = "red", alpha = 1)
+
+```
+
